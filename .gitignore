@@ -1,0 +1,22 @@
+# Data — see data/README.md for download instructions
+*.csv
+*.json
+*.sqlite
+!data/README.md
+
+# Models
+*.pkl
+*.sav
+*.joblib
+
+# Training artifacts
+catboost_info/
+lightgbm_info/
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
