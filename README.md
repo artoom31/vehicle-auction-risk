@@ -1,136 +1,145 @@
-# Vehicle Auction Risk Classification
+# Скоринг риска на автоаукционе
 
-**Predicting "bad buys" at wholesale car auctions — with every model and every metric implemented from scratch and validated against scikit-learn.**
+**Предсказание неудачных покупок на оптовом автоаукционе. Все модели и метрики написаны с нуля на NumPy и сверены с scikit-learn.**
 
-The question driving this project is not "what scores highest" but **which model still works when the data moves**. The dataset spans two years of auctions; the answer turns out to favour the simplest model in the comparison, and the last section explains why.
+Главный вопрос проекта — не «что даёт лучшую метрику», а **какая модель продолжает работать, когда данные смещаются во времени**.
 
----
+## Задача
 
-## Problem
+Дилер на оптовом аукционе рискует купить машину со скрытыми дефектами. Нужно оценить вероятность такой покупки.
 
-A dealer buying at a wholesale auto auction risks acquiring a vehicle with serious undisclosed problems (a *kick*). The task is to score each transaction with the probability that it is a bad buy.
+Это скоринг редкого события: положительный класс ~12%, категориальные признаки высокой мощности, строгий порядок во времени. По структуре — то же самое, что скоринг дефолта по кредиту, поэтому основная метрика здесь **Gini** (`2·AUC − 1`), а не accuracy.
 
-This is a **rare-event scoring problem**: a heavily imbalanced positive class (~12%), a mix of high-cardinality categorical and numeric features, and a strict temporal ordering. Structurally it is the same shape as credit-default scoring, which is why **Gini** — the industry-standard ranking metric, `2·AUC − 1` — is used throughout rather than accuracy.
+Данные: Kaggle [*Don't Get Kicked!*](https://www.kaggle.com/c/DontGetKicked) — 72 983 сделки, 31 признак. В репозиторий не коммитятся, инструкция в [`data/README.md`](./data/README.md).
 
-## Data
+## Методология
 
-Kaggle [*Don't Get Kicked!*](https://www.kaggle.com/c/DontGetKicked) (Carvana), `training.csv` — 72,983 transactions, 31 features, target `IsBadBuy`.
+**Разбиение по времени, а не случайное.** Данные упорядочены по `PurchDate` и разрезаны на трети. Случайное разбиение позволило бы модели учиться на будущих аукционах — утечка, которая завышает офлайн-метрики и исчезает в продакшене.
 
-The dataset is not committed. See [`data/README.md`](./data/README.md) for download instructions.
+**Кодировщики обучаются только на train.** Это сразу вскрыло ловушку: `PRIMEUNIT` и `AUCGUART` заполнены на 0.01% в train и на 13.2% в test. Модель на них ничему не учится, а на тесте ведёт себя непредсказуемо — оба признака выброшены.
 
-| Split | Rows | Date range | Positive rate |
-|---|---|---|---|
-| train | 24,084 | 2009-01-05 → 2009-09-11 | 11.4% |
-| valid | 24,084 | 2009-09-11 → 2010-05-11 | 13.1% |
-| test | 24,815 | 2010-05-11 → 2010-12-30 | 12.3% |
+**13 сконструированных признаков:** отношения цены к четырём справочным ценам MMR, пробег на год, отклонения от групповых средних.
 
-## Methodology
+## Реализовано с нуля
 
-**1. Temporal split, not random.** The data is ordered by `PurchDate` and cut into thirds. A random split would let the model learn from future auctions to predict past ones — a leak that inflates offline metrics and disappears in production.
+Логистическая регрессия (mini-batch SGD, L2, градиент NLL выведен руками), гауссовский наивный байес, батчевый KNN, CART-классификатор и регрессор, случайный лес, Extra Trees, градиентный бустинг.
 
-**2. Leakage-safe encoding.** All encoders are fit on train only:
-- one-hot for low-cardinality categoricals (`Auction`, `WheelType`, `Size`, `Color`, `VNST`, …)
-- count encoding with an explicit fallback for categories unseen in train (`Make`, `Model`, `Trim`, `SubModel`, `BYRNO`, `VNZIP1`)
+Метрики ROC-AUC, Gini, precision, recall, F1 и AUC-PR воспроизводят scikit-learn с расхождением **0.0000**.
 
-This immediately surfaced a real trap: `PRIMEUNIT` and `AUCGUART` are **99.99% missing in train but 13.2% populated in test**. A model trained on them learns nothing usable and then behaves unpredictably on the test period — both features were dropped.
+## Результаты
 
-**3. Feature engineering.** 13 derived features: price ratios (`VehBCost` against each of the four MMR reference prices, current vs. acquisition, clean vs. average, retail vs. auction), `odo_per_year`, `ratio_warranty_to_cost`, and group-mean deviations (`VehBCost_dev_from_Model`, `Model_mean_VehicleAge`, `Size_mean_VehBCost`, …).
+Свои ансамбли против промышленных библиотек, valid Gini:
 
-**4. Model selection and tuning.** Regularization path over `C`, L1 vs L2 penalty, `k` sweep for KNN, depth sweeps for trees, early stopping for the boosting libraries — all selected on the validation third, with the test third touched once.
-
-## What is implemented from scratch
-
-Everything below is written in NumPy and numerically compared against the scikit-learn equivalent.
-
-| Component | Notes |
+| Модель | valid Gini |
 |---|---|
-| `MyLogisticRegression` | mini-batch SGD, L2 penalty, hand-derived NLL gradient `(p − y)` |
-| `MyGaussianNB` | variance smoothing, joint log-likelihood |
-| `MyKNNClassifier` | batched distance computation |
-| `Node` | Gini impurity (classification) / std reduction (regression), best-split search |
-| `DecisionTreeClassifier` / `DecisionTreeRegressor` | CART with `max_depth`, `min_samples_split`, `min_samples_leaf`, `max_features` |
-| `RandomForestClassifier` | bagging over the above, seeded and reproducible |
-| `ExtraTreesClassifier` | randomized split thresholds |
-| `GradientBoostingClassifier` | binary cross-entropy gradient, `decision_function` → sigmoid → `predict_proba` |
-| Metrics | ROC-AUC, Gini, Precision, Recall, F1, AUC-PR |
+| своё дерево (глубина 7) | 0.4256 |
+| свой случайный лес | 0.4622 |
+| **свой градиентный бустинг** | **0.4833** |
+| LightGBM | 0.4927 |
+| XGBoost | 0.4931 |
+| CatBoost | 0.4956 |
 
-**Metric verification** — all four metrics reproduce scikit-learn exactly:
+Отставание своего бустинга от настроенного CatBoost — 0.012 Gini. Этого достаточно, чтобы подтвердить корректность вывода градиента, а сам разрыв показывает, что дают гистограммное биннинг, leaf-wise рост и нативная работа с категориями.
 
-| | my implementation | sklearn | abs diff |
-|---|---|---|---|
-| Precision @ 0.5 | 0.631961 | 0.631961 | 0.0 |
-| Recall @ 0.5 | 0.244458 | 0.244458 | 0.0 |
-| F1 @ 0.5 | 0.352544 | 0.352544 | 0.0 |
-| AUC-PR | 0.401153 | 0.401153 | 0.0 |
+## Главный вывод
 
-Gini likewise matches `2·roc_auc_score − 1` to 0.0 across all three baseline models.
+**Регуляризованная линейная модель обобщается лучше CatBoost на отложенном периоде, хотя проигрывает ему на валидации.**
 
-## Results
-
-**Own decision tree vs. scikit-learn** (valid Gini):
-
-| max_depth | mine | sklearn |
+| Модель | train → test Gini | разрыв |
 |---|---|---|
-| 3 | 0.4284 | 0.4347 |
-| 5 | 0.4352 | 0.4398 |
-| 7 | 0.4256 | 0.4295 |
-| 9 | 0.4031 | 0.4024 |
+| L1-логрегрессия | 0.5181 → 0.4926 | **0.026** |
+| CatBoost | 0.5968 → 0.4757 | **0.121** |
 
-**Own ensembles vs. production GBDT libraries** (valid Gini):
+CatBoost выигрывает валидацию на 0.016 Gini и проигрывает тест на 0.017. Валидация лежит во времени между train и test и потому частично защищена близостью к обучающему окну. Тестовая треть — на год позже, и там лишняя ёмкость превращается в запомненную структуру, которой больше нет.
 
-| Model | valid Gini |
-|---|---|
-| own decision tree (depth 7) | 0.4256 |
-| own Random Forest (100 trees, depth 12) | 0.4622 |
-| **own Gradient Boosting (200 trees, depth 4)** | **0.4833** |
-| LightGBM (best_iter 152) | 0.4927 |
-| XGBoost (best_iter 194) | 0.4931 |
-| XGBoost DART | 0.4900 |
-| CatBoost (best_iter 568) | 0.4956 |
+Практический смысл: на дрейфующих данных **выбор модели по одной только валидации даёт неверный ответ**. Разрыв train→test честнее. Именно поэтому весь проект построен на хронологическом разбиении — случайное скрыло бы эффект полностью.
 
-The hand-written boosting implementation lands **0.012 Gini** behind tuned CatBoost — close enough to confirm the gradient derivation is correct, and the gap is a fair measure of what histogram binning, leaf-wise growth and native categorical handling actually buy you.
-
-**Final models on the untouched test third:**
-
-| Model | train Gini | valid Gini | test Gini | test AUC-PR |
-|---|---|---|---|---|
-| L1 logistic regression (`C = 0.03`) + engineered features | 0.5181 | 0.4796 | **0.4926** | 0.4487 |
-| CatBoost | 0.5968 | 0.4956 | 0.4757 | — |
-| Gaussian NB | — | 0.3842 | 0.3438 | 0.1993 |
-| KNN (k = 400) | — | 0.4524 | 0.4653 | 0.4172 |
-
-## Conclusion
-
-**The regularized linear model generalizes better than CatBoost on the held-out period despite scoring lower on validation.**
-
-| | train → test Gini gap |
-|---|---|
-| L1 logistic regression | 0.5181 → 0.4926 = **0.026** |
-| CatBoost | 0.5968 → 0.4757 = **0.121** |
-
-CatBoost wins validation by 0.016 Gini and loses the test period by 0.017. Validation sits between train and test in time, so it is partly protected by proximity to the training window; the test third is a full year later, and that is where the extra capacity turns into memorized structure that no longer holds.
-
-The practical reading: on a dataset that drifts, **selecting on validation score alone picks the wrong model**. The train-to-test gap is the more honest selection criterion, and it is the reason the whole project is built on a chronological split — a random split would have hidden the effect completely and handed the decision to CatBoost.
-
-## Layout
+## Структура и запуск
 
 ```
-src/
-  classification.ipynb    # ML4 — split, encoding, from-scratch models & metrics, tuning
-  ML5_decision_trees.ipynb # ML5 — trees, ensembles, GBDT library comparison
-  trees.py                # from-scratch tree & ensemble library (~400 lines)
-data/
-  README.md               # how to obtain training.csv
+src/classification.ipynb     # разбиение, кодирование, свои модели и метрики
+src/ML5_decision_trees.ipynb # деревья, ансамбли, сравнение с GBDT-библиотеками
+src/trees.py                 # своя библиотека деревьев и ансамблей (~400 строк)
 ```
-
-## How to run
 
 ```bash
 pip install numpy pandas scikit-learn lightgbm xgboost catboost matplotlib jupyter
 ```
 
-Place `training.csv` in `data/`, then run `src/classification.ipynb` followed by `src/ML5_decision_trees.ipynb`. All random seeds are fixed; results are reproducible.
+Положите `training.csv` в `data/` и запустите ноутбуки в порядке выше. Все seed зафиксированы, результаты воспроизводимы.
 
-## Notes
+Проект сделан в рамках специализации Machine Learning Школы 21 и защищён на устном peer review. Комментарии в ноутбуках — на русском.
 
-Built during the School 21 Machine Learning specialization and defended in live peer review — every decision above had to be justified orally to reviewers who had the code open in front of them. Notebook commentary is in Russian.
+---
+
+# English
+
+**Predicting "bad buys" at wholesale car auctions. Every model and every metric implemented from scratch in NumPy and validated against scikit-learn.**
+
+The driving question is not "what scores highest" but **which model still works when the data moves**.
+
+## Problem
+
+A dealer at a wholesale auction risks buying a vehicle with undisclosed defects. The task is to score the probability of that.
+
+This is rare-event scoring: ~12% positive class, high-cardinality categoricals, strict temporal ordering. Structurally identical to credit-default scoring, which is why **Gini** (`2·AUC − 1`) is the metric throughout rather than accuracy.
+
+Data: Kaggle [*Don't Get Kicked!*](https://www.kaggle.com/c/DontGetKicked) — 72,983 transactions, 31 features. Not committed; see [`data/README.md`](./data/README.md).
+
+## Methodology
+
+**Chronological split, not random.** Ordered by `PurchDate` and cut into thirds. A random split would let the model learn from future auctions — a leak that inflates offline metrics and vanishes in production.
+
+**Encoders fit on train only.** This surfaced a real trap: `PRIMEUNIT` and `AUCGUART` are 0.01% populated in train and 13.2% in test. Both dropped.
+
+**13 engineered features:** price ratios against the four MMR reference prices, odometer per year, deviations from group means.
+
+## Implemented from scratch
+
+Logistic regression (mini-batch SGD, L2, hand-derived NLL gradient), Gaussian Naive Bayes, batched KNN, CART classifier and regressor, Random Forest, Extra Trees, gradient boosting.
+
+ROC-AUC, Gini, precision, recall, F1 and AUC-PR all reproduce scikit-learn to **0.0000**.
+
+## Results
+
+Own ensembles against production libraries, valid Gini:
+
+| Model | valid Gini |
+|---|---|
+| own tree (depth 7) | 0.4256 |
+| own Random Forest | 0.4622 |
+| **own Gradient Boosting** | **0.4833** |
+| LightGBM | 0.4927 |
+| XGBoost | 0.4931 |
+| CatBoost | 0.4956 |
+
+The hand-written booster lands 0.012 Gini behind tuned CatBoost — close enough to confirm the gradient derivation, and the gap measures what histogram binning, leaf-wise growth and native categorical handling actually buy.
+
+## Conclusion
+
+**The regularized linear model generalizes better than CatBoost on the held-out period despite scoring lower on validation.**
+
+| Model | train → test Gini | gap |
+|---|---|---|
+| L1 logistic regression | 0.5181 → 0.4926 | **0.026** |
+| CatBoost | 0.5968 → 0.4757 | **0.121** |
+
+CatBoost wins validation by 0.016 Gini and loses the test period by 0.017. Validation sits between train and test in time, so it is partly protected by proximity to the training window. The test third is a full year later, and that is where extra capacity turns into memorized structure.
+
+The practical reading: on drifting data, **selecting on validation score alone picks the wrong model**. The train-to-test gap is the more honest criterion — and the reason the project is built on a chronological split, which a random split would have hidden entirely.
+
+## Layout and running
+
+```
+src/classification.ipynb      # split, encoding, from-scratch models and metrics
+src/ML5_decision_trees.ipynb  # trees, ensembles, GBDT library comparison
+src/trees.py                  # from-scratch tree and ensemble library (~400 lines)
+```
+
+```bash
+pip install numpy pandas scikit-learn lightgbm xgboost catboost matplotlib jupyter
+```
+
+Place `training.csv` in `data/` and run the notebooks in that order. All seeds fixed; results reproducible.
+
+Built during the School 21 Machine Learning specialization and defended in live peer review. Notebook commentary is in Russian.
